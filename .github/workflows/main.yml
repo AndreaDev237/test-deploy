@@ -58,7 +58,7 @@ jobs:
       - name: Wait for DNS propagation
         run: sleep 60  # Attendere un minuto per la propagazione DNS
       
-      - name: Check site reachability
+      - name: Check site reachability and React app functionality
         id: check_site
         run: |
           URL="${{ needs.deploy.outputs.page_url }}"
@@ -70,24 +70,102 @@ jobs:
           SLEEP_TIME=10
           
           while [ $ATTEMPTS -lt $MAX_ATTEMPTS ]; do
+            # Controlla che la pagina principale sia raggiungibile
             HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
             
             if [ "$HTTP_STATUS" == "200" ]; then
-              echo "Site is reachable with status 200!"
-              echo "success=true" >> $GITHUB_OUTPUT
-              exit 0
+              echo "Main page is reachable with status 200!"
+              
+              # Scarica la pagina HTML per analizzarla
+              HTML_CONTENT=$(curl -s "$URL")
+              
+              # Estrai i percorsi dei file JS principali di React (solitamente in pattern come /static/js/main.*.js)
+              JS_ASSETS=$(echo "$HTML_CONTENT" | grep -o '/static/js/[^"]*\.js' | sort -u)
+              CSS_ASSETS=$(echo "$HTML_CONTENT" | grep -o '/static/css/[^"]*\.css' | sort -u)
+              
+              # Se non trova i pattern standard, cerca quelli generati da Vite (come /assets/*.js)
+              if [ -z "$JS_ASSETS" ]; then
+                JS_ASSETS=$(echo "$HTML_CONTENT" | grep -o '/assets/[^"]*\.js' | sort -u)
+              fi
+              if [ -z "$CSS_ASSETS" ]; then
+                CSS_ASSETS=$(echo "$HTML_CONTENT" | grep -o '/assets/[^"]*\.css' | sort -u)
+              fi
+              
+              # Se ancora non trova, cerca qualsiasi riferimento a JS e CSS
+              if [ -z "$JS_ASSETS" ]; then
+                JS_ASSETS=$(echo "$HTML_CONTENT" | grep -o '[^"]*\.js' | grep -v "node_modules" | sort -u)
+              fi
+              if [ -z "$CSS_ASSETS" ]; then
+                CSS_ASSETS=$(echo "$HTML_CONTENT" | grep -o '[^"]*\.css' | grep -v "node_modules" | sort -u)
+              fi
+              
+              echo "Found JS assets: $JS_ASSETS"
+              echo "Found CSS assets: $CSS_ASSETS"
+              
+              # Controlla che almeno un file JS e un file CSS siano raggiungibili
+              ASSETS_OK=true
+              
+              # Verifica i file JS
+              for asset in $JS_ASSETS; do
+                # Assicurati che l'URL dell'asset sia completo
+                if [[ "$asset" == /* ]]; then
+                  ASSET_URL="${URL%/}$asset"
+                else
+                  ASSET_URL="${URL%/}/$asset"
+                fi
+                
+                ASSET_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$ASSET_URL")
+                echo "Checking JS asset: $ASSET_URL - Status: $ASSET_STATUS"
+                
+                if [ "$ASSET_STATUS" != "200" ]; then
+                  echo "JS asset not accessible: $ASSET_URL"
+                  ASSETS_OK=false
+                  break
+                fi
+              done
+              
+              # Se i file JS sono ok, verifica i file CSS
+              if [ "$ASSETS_OK" = true ] && [ -n "$CSS_ASSETS" ]; then
+                for asset in $CSS_ASSETS; do
+                  # Assicurati che l'URL dell'asset sia completo
+                  if [[ "$asset" == /* ]]; then
+                    ASSET_URL="${URL%/}$asset"
+                  else
+                    ASSET_URL="${URL%/}/$asset"
+                  fi
+                  
+                  ASSET_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$ASSET_URL")
+                  echo "Checking CSS asset: $ASSET_URL - Status: $ASSET_STATUS"
+                  
+                  if [ "$ASSET_STATUS" != "200" ]; then
+                    echo "CSS asset not accessible: $ASSET_URL"
+                    ASSETS_OK=false
+                    break
+                  fi
+                done
+              fi
+              
+              # Se tutti gli asset sono accessibili, il controllo è passato
+              if [ "$ASSETS_OK" = true ]; then
+                echo "All critical assets are accessible!"
+                echo "success=true" >> $GITHUB_OUTPUT
+                exit 0
+              else
+                echo "Some critical assets are not accessible. Trying again..."
+              fi
             else
               echo "Attempt $(($ATTEMPTS+1))/$MAX_ATTEMPTS: Site returned HTTP status $HTTP_STATUS"
-              ATTEMPTS=$(($ATTEMPTS+1))
-              
-              if [ $ATTEMPTS -lt $MAX_ATTEMPTS ]; then
-                echo "Waiting ${SLEEP_TIME}s before next attempt..."
-                sleep $SLEEP_TIME
-              fi
+            fi
+            
+            ATTEMPTS=$(($ATTEMPTS+1))
+            
+            if [ $ATTEMPTS -lt $MAX_ATTEMPTS ]; then
+              echo "Waiting ${SLEEP_TIME}s before next attempt..."
+              sleep $SLEEP_TIME
             fi
           done
           
-          echo "Site is not reachable after $MAX_ATTEMPTS attempts!"
+          echo "React app is not fully functional after $MAX_ATTEMPTS attempts!"
           echo "success=false" >> $GITHUB_OUTPUT
           exit 1
         continue-on-error: true
