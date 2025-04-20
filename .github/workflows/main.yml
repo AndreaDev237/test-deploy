@@ -11,22 +11,39 @@ permissions:
   contents: read
   pages: write
   id-token: write
-  actions: write # Permesso necessario per il rollback delle azioni
 # Allow one concurrent deployment
 concurrency:
   group: 'pages'
   cancel-in-progress: true
-
 jobs:
+  # Add a test job
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Run linting
+        run: npm run lint
+      - name: Run tests
+        run: npm test
+        env:
+          # Imposta questa variabile a "false" per far fallire il test
+          VITE_FAIL_TEST_ACTIVE: ${{ secrets.VITE_FAIL_TEST_ACTIVE }}
+
   # Single deploy job since we're just deploying
   deploy:
+    needs: test  # Il job deploy dipende dal job test
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
-    outputs:
-      page_url: ${{ steps.deployment.outputs.page_url }}
-      deployment_id: ${{ steps.deployment.outputs.deployment_id }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,159 +66,3 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
-  
-  # Job per verificare la raggiungibilità del sito e fare rollback se necessario
-  verify-and-rollback:
-    needs: deploy
-    runs-on: ubuntu-latest
-    steps:
-      - name: Wait for DNS propagation
-        run: sleep 60  # Attendere un minuto per la propagazione DNS
-      
-      - name: Check site reachability and React app functionality
-        id: check_site
-        run: |
-          URL="${{ needs.deploy.outputs.page_url }}"
-          echo "Verifying site reachability: $URL"
-          
-          # Tentativi multipli con un breve intervallo
-          MAX_ATTEMPTS=5
-          ATTEMPTS=0
-          SLEEP_TIME=10
-          
-          while [ $ATTEMPTS -lt $MAX_ATTEMPTS ]; do
-            # Controlla che la pagina principale sia raggiungibile
-            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
-            
-            if [ "$HTTP_STATUS" == "200" ]; then
-              echo "Main page is reachable with status 200!"
-              
-              # Scarica la pagina HTML per analizzarla
-              HTML_CONTENT=$(curl -s "$URL")
-              
-              # Estrai i percorsi dei file JS principali di React (solitamente in pattern come /static/js/main.*.js)
-              JS_ASSETS=$(echo "$HTML_CONTENT" | grep -o '/static/js/[^"]*\.js' | sort -u)
-              CSS_ASSETS=$(echo "$HTML_CONTENT" | grep -o '/static/css/[^"]*\.css' | sort -u)
-              
-              # Se non trova i pattern standard, cerca quelli generati da Vite (come /assets/*.js)
-              if [ -z "$JS_ASSETS" ]; then
-                JS_ASSETS=$(echo "$HTML_CONTENT" | grep -o '/assets/[^"]*\.js' | sort -u)
-              fi
-              if [ -z "$CSS_ASSETS" ]; then
-                CSS_ASSETS=$(echo "$HTML_CONTENT" | grep -o '/assets/[^"]*\.css' | sort -u)
-              fi
-              
-              # Se ancora non trova, cerca qualsiasi riferimento a JS e CSS
-              if [ -z "$JS_ASSETS" ]; then
-                JS_ASSETS=$(echo "$HTML_CONTENT" | grep -o '[^"]*\.js' | grep -v "node_modules" | sort -u)
-              fi
-              if [ -z "$CSS_ASSETS" ]; then
-                CSS_ASSETS=$(echo "$HTML_CONTENT" | grep -o '[^"]*\.css' | grep -v "node_modules" | sort -u)
-              fi
-              
-              echo "Found JS assets: $JS_ASSETS"
-              echo "Found CSS assets: $CSS_ASSETS"
-              
-              # Controlla che almeno un file JS e un file CSS siano raggiungibili
-              ASSETS_OK=true
-              
-              # Verifica i file JS
-              for asset in $JS_ASSETS; do
-                # Assicurati che l'URL dell'asset sia completo
-                if [[ "$asset" == /* ]]; then
-                  ASSET_URL="${URL%/}$asset"
-                else
-                  ASSET_URL="${URL%/}/$asset"
-                fi
-                
-                ASSET_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$ASSET_URL")
-                echo "Checking JS asset: $ASSET_URL - Status: $ASSET_STATUS"
-                
-                if [ "$ASSET_STATUS" != "200" ]; then
-                  echo "JS asset not accessible: $ASSET_URL"
-                  ASSETS_OK=false
-                  break
-                fi
-              done
-              
-              # Se i file JS sono ok, verifica i file CSS
-              if [ "$ASSETS_OK" = true ] && [ -n "$CSS_ASSETS" ]; then
-                for asset in $CSS_ASSETS; do
-                  # Assicurati che l'URL dell'asset sia completo
-                  if [[ "$asset" == /* ]]; then
-                    ASSET_URL="${URL%/}$asset"
-                  else
-                    ASSET_URL="${URL%/}/$asset"
-                  fi
-                  
-                  ASSET_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$ASSET_URL")
-                  echo "Checking CSS asset: $ASSET_URL - Status: $ASSET_STATUS"
-                  
-                  if [ "$ASSET_STATUS" != "200" ]; then
-                    echo "CSS asset not accessible: $ASSET_URL"
-                    ASSETS_OK=false
-                    break
-                  fi
-                done
-              fi
-              
-              # Se tutti gli asset sono accessibili, il controllo è passato
-              if [ "$ASSETS_OK" = true ]; then
-                echo "All critical assets are accessible!"
-                echo "success=true" >> $GITHUB_OUTPUT
-                exit 0
-              else
-                echo "Some critical assets are not accessible. Trying again..."
-              fi
-            else
-              echo "Attempt $(($ATTEMPTS+1))/$MAX_ATTEMPTS: Site returned HTTP status $HTTP_STATUS"
-            fi
-            
-            ATTEMPTS=$(($ATTEMPTS+1))
-            
-            if [ $ATTEMPTS -lt $MAX_ATTEMPTS ]; then
-              echo "Waiting ${SLEEP_TIME}s before next attempt..."
-              sleep $SLEEP_TIME
-            fi
-          done
-          
-          echo "React app is not fully functional after $MAX_ATTEMPTS attempts!"
-          echo "success=false" >> $GITHUB_OUTPUT
-          exit 1
-        continue-on-error: true
-      
-      - name: Rollback to previous deployment
-        if: steps.check_site.outputs.success != 'true'
-        run: |
-          echo "Site is not accessible! Initiating rollback..."
-          
-          # Usa GitHub API per ottenere i deployment precedenti
-          REPO="${GITHUB_REPOSITORY}"
-          API_URL="https://api.github.com/repos/${REPO}/deployments?environment=github-pages&per_page=2"
-          
-          DEPLOYMENTS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "$API_URL")
-          
-          # Estrai l'ID del precedente deployment (il secondo nell'elenco)
-          PREVIOUS_DEPLOYMENT_ID=$(echo "$DEPLOYMENTS" | jq -r '.[1].id')
-          
-          if [ -n "$PREVIOUS_DEPLOYMENT_ID" ] && [ "$PREVIOUS_DEPLOYMENT_ID" != "null" ]; then
-            echo "Found previous deployment ID: $PREVIOUS_DEPLOYMENT_ID"
-            
-            # Crea uno stato "inactive" per il deployment corrente
-            CURRENT_DEPLOYMENT_ID="${{ needs.deploy.outputs.deployment_id }}"
-            INACTIVE_URL="https://api.github.com/repos/${REPO}/deployments/${CURRENT_DEPLOYMENT_ID}/statuses"
-            curl -s -X POST -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                 -H "Accept: application/vnd.github+json" \
-                 -d '{"state":"inactive"}' "$INACTIVE_URL"
-            
-            # Attiva nuovamente il deployment precedente
-            ACTIVE_URL="https://api.github.com/repos/${REPO}/deployments/${PREVIOUS_DEPLOYMENT_ID}/statuses"
-            curl -s -X POST -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                 -H "Accept: application/vnd.github+json" \
-                 -d '{"state":"success"}' "$ACTIVE_URL"
-            
-            echo "Rollback completed to deployment ID: $PREVIOUS_DEPLOYMENT_ID"
-          else
-            echo "No previous deployment found to rollback to!"
-            exit 1
-          fi
